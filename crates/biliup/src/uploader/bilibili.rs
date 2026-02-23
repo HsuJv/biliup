@@ -1,29 +1,30 @@
+use crate::ReqwestClientBuilderExt;
 use crate::error::{Kind, Result};
 use crate::uploader::credential::LoginInfo;
-use crate::ReqwestClientBuilderExt;
 use serde::ser::Error;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
+use bon::Builder;
 use std::fmt::{Display, Formatter};
 use std::num::ParseIntError;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
-use typed_builder::TypedBuilder;
 
-#[derive(Serialize, Deserialize, Debug, TypedBuilder)]
-#[builder(field_defaults(default))]
+#[derive(Serialize, Deserialize, Debug, Builder)]
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct Studio {
     /// 是否转载, 1-自制 2-转载
     #[cfg_attr(feature = "cli", clap(long, default_value = "1"))]
     #[builder(default = 1)]
+    #[serde(default = "default_copyright")]
     pub copyright: u8,
 
     /// 转载来源
     #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
     pub source: String,
 
     /// 投稿分区
@@ -33,41 +34,44 @@ pub struct Studio {
 
     /// 视频封面
     #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
     pub cover: String,
 
     /// 视频标题
     #[cfg_attr(feature = "cli", clap(long, default_value_t))]
-    #[builder(!default, setter(into))]
     pub title: String,
 
     #[cfg_attr(feature = "cli", clap(skip))]
+    #[serde(default)]
+    #[builder(default)]
     pub desc_format_id: u32,
 
     /// 视频简介
     #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
     pub desc: String,
 
     /// 视频简介v2
     #[serde(default)]
-    #[builder(!default)]
     #[cfg_attr(feature = "cli", clap(skip))]
     pub desc_v2: Option<Vec<Credit>>,
 
     /// 空间动态
     #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
     pub dynamic: String,
 
     #[cfg_attr(feature = "cli", clap(skip))]
     #[serde(default)]
-    #[builder(default, setter(skip))]
+    #[builder(default)]
     pub subtitle: Subtitle,
 
     /// 视频标签，逗号分隔多个tag
     #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
     pub tag: String,
 
     #[serde(default)]
-    #[builder(!default)]
     #[cfg_attr(feature = "cli", clap(skip))]
     pub videos: Vec<Video>,
 
@@ -77,10 +81,12 @@ pub struct Studio {
 
     #[cfg_attr(feature = "cli", clap(skip))]
     #[serde(default)]
+    #[builder(default)]
     pub open_subtitle: bool,
 
     #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
     #[serde(default)]
+    #[builder(default)]
     pub interactive: u8,
 
     #[cfg_attr(feature = "cli", clap(long))]
@@ -97,12 +103,18 @@ pub struct Studio {
     /// 是否开启 Hi-Res, 0-关闭 1-开启
     #[cfg_attr(feature = "cli", clap(long = "hires", default_value = "0"))]
     #[serde(default)]
+    #[builder(default)]
     pub lossless_music: u8,
 
     /// 0-允许转载，1-禁止转载
     #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
     #[serde(default)]
     pub no_reprint: u8,
+
+    /// 仅自己可见
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default)]
+    pub is_only_self: Option<u8>,
 
     /// 是否开启充电, 0-关闭 1-开启
     #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
@@ -136,6 +148,10 @@ pub struct Studio {
 
 fn parse_extra_fields(s: &str) -> std::result::Result<HashMap<String, Value>, String> {
     serde_json::from_str(s).map_err(|e| e.to_string())
+}
+
+fn default_copyright() -> u8 {
+    1
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -173,7 +189,7 @@ pub struct Subtitle {
     lan: String,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(PartialEq, Deserialize, Serialize, Debug, Clone)]
 pub struct Credit {
     #[serde(rename(deserialize = "type_id", serialize = "type"))]
     pub type_id: i8,
@@ -181,7 +197,7 @@ pub struct Credit {
     pub biz_id: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Video {
     pub title: Option<String>,
     pub filename: String,
@@ -198,6 +214,19 @@ impl Video {
             desc: "".into(),
             cid: 0,
         }
+    }
+
+    /// 截断标题到指定的最大字符数（默认80个字符，B站限制）
+    pub fn truncate_title(title: &str, max_chars: usize) -> String {
+        // 统计字符数（不是字节数）
+        let char_count = title.chars().count();
+        if char_count <= max_chars {
+            return title.to_string();
+        }
+
+        // 截断到max_chars-3个字符，然后添加"..."
+        let truncated: String = title.chars().take(max_chars - 3).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -345,10 +374,51 @@ impl BiliBili {
         }
     }
 
+    /// 通过 Web 接口投稿
+    pub async fn submit_by_web(
+        &self,
+        studio: &Studio,
+        proxy: Option<&str>,
+    ) -> Result<ResponseData> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let csrf = self.get_csrf()?;
+
+        let url_str = "https://member.bilibili.com/x/vu/web/add/v3";
+        let params = [("t", ts.to_string()), ("csrf", csrf.to_string())];
+        let url = reqwest::Url::parse_with_params(url_str, &params).unwrap();
+
+        let cookie = self.get_cookie()?;
+        let jar = reqwest::cookie::Jar::default();
+        jar.add_cookie_str(&cookie, &url);
+
+        let ret: ResponseData = reqwest::Client::proxy_builder(proxy)
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+            .cookie_provider(std::sync::Arc::new(jar))
+            .timeout(Duration::new(60, 0))
+            .build()?
+            .post(url)
+            .json(studio)
+            .send()
+            .await?
+            .json()
+            .await?;
+        info!("{:?}", ret);
+
+        if ret.code == 0 {
+            info!("Web 接口投稿成功");
+            Ok(ret)
+        } else {
+            Err(Kind::Custom(format!("{:?}", ret)))
+        }
+    }
+
     #[deprecated(note = "no longer working, fallback to `edit_by_app`")]
     pub async fn edit(&self, studio: &Studio, proxy: Option<&str>) -> Result<serde_json::Value> {
         warn!("客户端接口已失效, 将使用app接口");
-        self.edit_by_app(studio,proxy).await
+        self.edit_by_app(studio, proxy).await
     }
 
     pub async fn edit_by_web(&self, studio: &Studio) -> Result<serde_json::Value> {
@@ -379,8 +449,8 @@ impl BiliBili {
     pub async fn edit_by_app(
         &self,
         studio: &Studio,
-        proxy: Option<&str>,)
-        -> Result<serde_json::Value> {
+        proxy: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let payload = {
             let mut payload = json!({
                 "access_key": self.login_info.token_info.access_token,
@@ -417,7 +487,7 @@ impl BiliBili {
             .json()
             .await?;
         info!("{:?}", ret);
-        if  ret["code"]  == 0 {
+        if ret["code"] == 0 {
             info!("稿件修改成功");
             Ok(ret)
         } else {
@@ -557,21 +627,7 @@ impl BiliBili {
         let params = [("status", status), ("pn", &page_num.to_string())];
         let url = reqwest::Url::parse_with_params(url_str, &params).unwrap();
 
-        let cookie = self
-            .login_info
-            .cookie_info
-            .get("cookies")
-            .and_then(|c: &Value| c.as_array())
-            .ok_or("archives cookie error")?
-            .iter()
-            .filter_map(|c| match (c["name"].as_str(), c["value"].as_str()) {
-                (Some(name), Some(value)) => Some((name, value)),
-                _ => None,
-            })
-            .map(|c| format!("{}={}", c.0, c.1))
-            .collect::<Vec<_>>()
-            .join("; ");
-
+        let cookie = self.get_cookie()?;
         let jar = reqwest::cookie::Jar::default();
         jar.add_cookie_str(&cookie, &url);
 
@@ -600,7 +656,12 @@ impl BiliBili {
         }
     }
 
-    async fn recent_archives_data(&self, status: &str, from_page: u32, max_pages: Option<u32>) -> Result<Vec<Value>> {
+    async fn recent_archives_data(
+        &self,
+        status: &str,
+        from_page: u32,
+        max_pages: Option<u32>,
+    ) -> Result<Vec<Value>> {
         let mut first_page = self.archives(status, from_page).await?;
 
         let (page_size, count) = {
@@ -640,7 +701,12 @@ impl BiliBili {
     }
 
     /// 获取页数范围内的稿件
-    pub async fn recent_archives(&self, status: &str, from_page: u32, max_pages: Option<u32>) -> Result<Vec<Archive>> {
+    pub async fn recent_archives(
+        &self,
+        status: &str,
+        from_page: u32,
+        max_pages: Option<u32>,
+    ) -> Result<Vec<Archive>> {
         let studios = self
             .recent_archives_data(status, from_page, max_pages)
             .await?
@@ -653,6 +719,24 @@ impl BiliBili {
             .collect::<Vec<_>>();
 
         Ok(studios)
+    }
+
+    fn get_cookie(&self) -> Result<String> {
+        let cookie = self
+            .login_info
+            .cookie_info
+            .get("cookies")
+            .and_then(|c: &Value| c.as_array())
+            .ok_or("get cookie error")?
+            .iter()
+            .filter_map(|c| match (c["name"].as_str(), c["value"].as_str()) {
+                (Some(name), Some(value)) => Some((name, value)),
+                _ => None,
+            })
+            .map(|c| format!("{}={}", c.0, c.1))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Ok(cookie)
     }
 }
 
